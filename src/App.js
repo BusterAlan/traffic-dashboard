@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { AlertCircle, Users, Clock, Activity, Settings, Wifi } from 'lucide-react';
 
-const API_URL = 'http://localhost:3001/api';
+const WS_URL = 'ws://localhost:3000';
 
 export default function TrafficDashboard() {
   const [estado, setEstado] = useState({
@@ -21,64 +21,156 @@ export default function TrafficDashboard() {
     umbral_peatones: 3
   });
   
+  const [wsConectado, setWsConectado] = useState(false);
+  
   const [historial, setHistorial] = useState([]);
-  const [estadisticas, setEstadisticas] = useState({});
-  const [periodo, setPeriodo] = useState('24h');
+  const [estadisticas, setEstadisticas] = useState({
+    total_cruces: 0,
+    total_peatones: 0,
+    promedio_peatones: 0,
+    activaciones_automaticas: 0
+  });
   const [editandoConfig, setEditandoConfig] = useState(false);
-  const [esp32Conectado, setEsp32Conectado] = useState(true);
+  const [esp32Conectado, setEsp32Conectado] = useState(false);
+  
+  const wsRef = useRef(null);
 
+  // Función para convertir el estado del ESP32 al formato del dashboard
+  const convertirEstadoESP32 = (payloadESP32) => {
+    // Mapeo de estados del ESP32
+    // Formatos posibles:
+    // - RED_VEHICLE_GREEN_PEDESTRIAN
+    // - GREEN_VEHICLE_RED_PEDESTRIAN  
+    // - YELLOW_VEHICLE_RED_PEDESTRIAN
+    
+    let semaforo_autos = 'VERDE';
+    let semaforo_peatones = 'ROJO';
+    
+    const state = payloadESP32.state || '';
+
+    if (state.includes('RED_VEHICLE_GREEN_PEDESTRIAN')) {
+      semaforo_autos = 'ROJO';
+      semaforo_peatones = 'VERDE';
+    }
+    
+    if (state.includes('RED_VEHICLE')) {
+      semaforo_autos = 'ROJO';
+    } else if (state.includes('YELLOW_VEHICLE')) {
+      semaforo_autos = 'AMARILLO';
+    } else if (state.includes('GREEN_VEHICLE')) {
+      semaforo_autos = 'VERDE';
+    }
+    
+    if (state.includes('GREEN_PEDESTRIAN')) {
+      semaforo_peatones = 'VERDE';
+    } else if (state.includes('RED_PEDESTRIAN')) {
+      semaforo_peatones = 'ROJO';
+    }
+    
+    return {
+      peatones_esperando: payloadESP32.pedestrians_waiting || 0,
+      semaforo_autos,
+      semaforo_peatones,
+      mode: payloadESP32.mode || 'AUTO',
+      time_remaining_ms: payloadESP32.time_remaining_ms || 0,
+      timestamp: payloadESP32.timestamp || 0
+    };
+  };
+
+  // Conectar WebSocket
   useEffect(() => {
-    cargarDatos();
-    const interval = setInterval(cargarDatos, 2000);
-    return () => clearInterval(interval);
-  }, [periodo]);
+    conectarWebSocket();
+    
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, []);
 
-  const cargarDatos = async () => {
+  const conectarWebSocket = () => {
     try {
-      const [estadoRes, configRes, historialRes, statsRes] = await Promise.all([
-        fetch(`${API_URL}/estado`),
-        fetch(`${API_URL}/config`),
-        fetch(`${API_URL}/historial?periodo=${periodo}`),
-        fetch(`${API_URL}/estadisticas`)
-      ]);
+      const ws = new WebSocket(WS_URL);
       
-      setEstado(await estadoRes.json());
-      setConfig(await configRes.json());
-      setHistorial(await historialRes.json());
-      setEstadisticas(await statsRes.json());
-      setEsp32Conectado(true);
+      ws.onopen = () => {
+        console.log('✅ Conectado al servidor WebSocket');
+        setWsConectado(true);
+        setEsp32Conectado(true);
+      };
+      
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          
+          if (data.type === 'mqtt') {
+            console.log('📨 Mensaje MQTT recibido:', data);
+            
+            // Procesar según el topic
+            if (data.topic === 'trafficlight/state') {
+              const payload = JSON.parse(data.payload);
+              console.log('📊 Payload parseado:', payload);
+              
+              // Convertir el formato del ESP32 al formato esperado
+              const estadoConvertido = convertirEstadoESP32(payload);
+              console.log('🔄 Estado convertido:', estadoConvertido);
+              setEstado(estadoConvertido);
+            } 
+            else if (data.topic === 'trafficlight/status') {
+              const payload = JSON.parse(data.payload);
+              console.log('Estado del sistema:', payload);
+            }
+          }
+        } catch (err) {
+          console.error('❌ Error procesando mensaje:', err);
+        }
+      };
+      
+      ws.onerror = (error) => {
+        console.error('❌ Error WebSocket:', error);
+        setWsConectado(false);
+        setEsp32Conectado(false);
+      };
+      
+      ws.onclose = () => {
+        console.log('🔌 WebSocket desconectado. Reintentando en 3s...');
+        setWsConectado(false);
+        setEsp32Conectado(false);
+        setTimeout(conectarWebSocket, 3000);
+      };
+      
+      wsRef.current = ws;
     } catch (err) {
-      console.error('Error cargando datos:', err);
-      setEsp32Conectado(false);
+      console.error('Error al conectar WebSocket:', err);
     }
   };
 
-  const actualizarPeatones = async (cantidad) => {
-    try {
-      await fetch(`${API_URL}/peatones`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ numero_peatones: cantidad })
-      });
-      cargarDatos();
-    } catch (err) {
-      console.error('Error actualizando peatones:', err);
+  const enviarConfiguracion = (nuevaConfig) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'setConfig',
+        payload: nuevaConfig
+      }));
+      console.log('📤 Configuración enviada al ESP32:', nuevaConfig);
+    } else {
+      alert('❌ No hay conexión con el servidor');
     }
   };
 
-  const guardarConfiguracion = async () => {
-    try {
-      await fetch(`${API_URL}/config`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config)
-      });
-      setEditandoConfig(false);
-      alert('✅ Configuración guardada y enviada al ESP32');
-    } catch (err) {
-      console.error('Error guardando configuración:', err);
-      alert('❌ Error al guardar configuración');
-    }
+  const actualizarPeatones = (cantidad) => {
+    // Simulación local (en producción esto vendría del sensor)
+    setEstado(prev => ({
+      ...prev,
+      peatones_esperando: cantidad
+    }));
+    
+    // También podrías enviar esto al ESP32 si quieres
+    // enviarConfiguracion({ peatones_esperando: cantidad });
+  };
+
+  const guardarConfiguracion = () => {
+    enviarConfiguracion(config);
+    setEditandoConfig(false);
+    alert('✅ Configuración enviada al ESP32');
   };
 
   const styles = {
@@ -259,22 +351,6 @@ export default function TrafficDashboard() {
       fontSize: '36px',
       fontWeight: 'bold'
     },
-    periodButtons: {
-      display: 'flex',
-      gap: '8px',
-      flexWrap: 'wrap'
-    },
-    periodButton: (active) => ({
-      padding: '8px 16px',
-      borderRadius: '8px',
-      fontWeight: '600',
-      cursor: 'pointer',
-      border: 'none',
-      transition: 'all 0.2s',
-      fontSize: '14px',
-      backgroundColor: active ? '#3b82f6' : '#475569',
-      color: 'white'
-    }),
     input: {
       width: '100%',
       backgroundColor: '#0f172a',
@@ -316,11 +392,11 @@ export default function TrafficDashboard() {
             <h1 style={styles.title}>
               🚦 Control de Semáforos ESP32
             </h1>
-            <p style={styles.subtitle}>Sistema de gestión y monitoreo en tiempo real</p>
+            <p style={styles.subtitle}>Sistema de gestión y monitoreo en tiempo real vía MQTT</p>
           </div>
           <div style={styles.statusBadge(esp32Conectado)}>
             <Wifi size={20} />
-            <span>{esp32Conectado ? 'ESP32 Conectado' : 'ESP32 Desconectado'}</span>
+            <span>{esp32Conectado ? 'Servidor Conectado' : 'Desconectado'}</span>
           </div>
         </div>
 
@@ -344,9 +420,9 @@ export default function TrafficDashboard() {
               </span>
             </div>
             <div style={styles.infoText}>
-              Tiempo: {estado.semaforo_autos === 'VERDE' ? config.tiempo_verde_autos : 
-                       estado.semaforo_autos === 'AMARILLO' ? config.tiempo_amarillo_autos :
-                       config.tiempo_rojo_autos}s
+              Tiempo configurado: {estado.semaforo_autos === 'VERDE' ? (config.tiempo_verde_autos || 0) : 
+                       estado.semaforo_autos === 'AMARILLO' ? (config.tiempo_amarillo_autos || 0) :
+                       (config.tiempo_rojo_autos || 0)}s
             </div>
           </div>
 
@@ -367,8 +443,8 @@ export default function TrafficDashboard() {
               </span>
             </div>
             <div style={styles.infoText}>
-              Tiempo: {estado.semaforo_peatones === 'VERDE' ? config.tiempo_verde_peatones : 
-                       config.tiempo_rojo_peatones}s (Máx: {config.tiempo_maximo_peatones}s)
+              Tiempo configurado: {estado.semaforo_peatones === 'VERDE' ? (config.tiempo_verde_peatones || 0) : 
+                       (config.tiempo_rojo_peatones || 0)}s (Máx: {config.tiempo_maximo_peatones || 0}s)
             </div>
           </div>
         </div>
@@ -377,7 +453,7 @@ export default function TrafficDashboard() {
         <div style={styles.card}>
           <h3 style={styles.cardTitle}>
             <Users size={20} />
-            Peatones Esperando
+            Peatones Esperando (Simulación)
           </h3>
           
           <div style={styles.peatonesDisplay}>
@@ -436,7 +512,7 @@ export default function TrafficDashboard() {
           </div>
           
           <div style={styles.tipBox}>
-            💡 <strong>Tip:</strong> En producción, el ESP32 detectará automáticamente a los peatones con sensores
+            💡 <strong>Tip:</strong> Esta es una simulación. En producción, el ESP32 detectará automáticamente a los peatones con sensores.
           </div>
         </div>
 
@@ -477,47 +553,6 @@ export default function TrafficDashboard() {
           </div>
         </div>
 
-        {/* Histograma */}
-        <div style={{...styles.card, marginTop: '32px'}}>
-          <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '16px'}}>
-            <h3 style={{fontSize: '20px', fontWeight: '600', margin: 0}}>Historial de Cruces</h3>
-            <div style={styles.periodButtons}>
-              <button 
-                onClick={() => setPeriodo('24h')}
-                style={styles.periodButton(periodo === '24h')}
-              >
-                24 Horas
-              </button>
-              <button 
-                onClick={() => setPeriodo('7d')}
-                style={styles.periodButton(periodo === '7d')}
-              >
-                7 Días
-              </button>
-              <button 
-                onClick={() => setPeriodo('30d')}
-                style={styles.periodButton(periodo === '30d')}
-              >
-                30 Días
-              </button>
-            </div>
-          </div>
-          
-          <ResponsiveContainer width="100%" height={300}>
-            <BarChart data={historial}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-              <XAxis dataKey="periodo" stroke="#94a3b8" />
-              <YAxis stroke="#94a3b8" />
-              <Tooltip 
-                contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '8px' }}
-              />
-              <Legend />
-              <Bar dataKey="total_peatones" fill="#3b82f6" name="Peatones" />
-              <Bar dataKey="total_cruces" fill="#10b981" name="Cruces" />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-
         {/* Configuración */}
         <div style={{...styles.card, marginTop: '32px'}}>
           <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '16px'}}>
@@ -543,8 +578,8 @@ export default function TrafficDashboard() {
               </label>
               <input 
                 type="number"
-                value={config.tiempo_verde_autos}
-                onChange={(e) => setConfig({...config, tiempo_verde_autos: parseInt(e.target.value)})}
+                value={config.tiempo_verde_autos || 0}
+                onChange={(e) => setConfig({...config, tiempo_verde_autos: parseInt(e.target.value) || 0})}
                 disabled={!editandoConfig}
                 style={{...styles.input, opacity: editandoConfig ? 1 : 0.5}}
               />
@@ -557,8 +592,8 @@ export default function TrafficDashboard() {
               </label>
               <input 
                 type="number"
-                value={config.tiempo_amarillo_autos}
-                onChange={(e) => setConfig({...config, tiempo_amarillo_autos: parseInt(e.target.value)})}
+                value={config.tiempo_amarillo_autos || 0}
+                onChange={(e) => setConfig({...config, tiempo_amarillo_autos: parseInt(e.target.value) || 0})}
                 disabled={!editandoConfig}
                 style={{...styles.input, opacity: editandoConfig ? 1 : 0.5}}
               />
@@ -571,8 +606,8 @@ export default function TrafficDashboard() {
               </label>
               <input 
                 type="number"
-                value={config.tiempo_rojo_autos}
-                onChange={(e) => setConfig({...config, tiempo_rojo_autos: parseInt(e.target.value)})}
+                value={config.tiempo_rojo_autos || 0}
+                onChange={(e) => setConfig({...config, tiempo_rojo_autos: parseInt(e.target.value) || 0})}
                 disabled={!editandoConfig}
                 style={{...styles.input, opacity: editandoConfig ? 1 : 0.5}}
               />
@@ -585,8 +620,8 @@ export default function TrafficDashboard() {
               </label>
               <input 
                 type="number"
-                value={config.tiempo_verde_peatones}
-                onChange={(e) => setConfig({...config, tiempo_verde_peatones: parseInt(e.target.value)})}
+                value={config.tiempo_verde_peatones || 0}
+                onChange={(e) => setConfig({...config, tiempo_verde_peatones: parseInt(e.target.value) || 0})}
                 disabled={!editandoConfig}
                 style={{...styles.input, opacity: editandoConfig ? 1 : 0.5}}
               />
@@ -599,8 +634,8 @@ export default function TrafficDashboard() {
               </label>
               <input 
                 type="number"
-                value={config.tiempo_rojo_peatones}
-                onChange={(e) => setConfig({...config, tiempo_rojo_peatones: parseInt(e.target.value)})}
+                value={config.tiempo_rojo_peatones || 0}
+                onChange={(e) => setConfig({...config, tiempo_rojo_peatones: parseInt(e.target.value) || 0})}
                 disabled={!editandoConfig}
                 style={{...styles.input, opacity: editandoConfig ? 1 : 0.5}}
               />
@@ -613,8 +648,8 @@ export default function TrafficDashboard() {
               </label>
               <input 
                 type="number"
-                value={config.tiempo_maximo_peatones}
-                onChange={(e) => setConfig({...config, tiempo_maximo_peatones: parseInt(e.target.value)})}
+                value={config.tiempo_maximo_peatones || 0}
+                onChange={(e) => setConfig({...config, tiempo_maximo_peatones: parseInt(e.target.value) || 0})}
                 disabled={!editandoConfig}
                 style={{...styles.input, opacity: editandoConfig ? 1 : 0.5}}
               />
@@ -627,8 +662,8 @@ export default function TrafficDashboard() {
               </label>
               <input 
                 type="number"
-                value={config.umbral_peatones}
-                onChange={(e) => setConfig({...config, umbral_peatones: parseInt(e.target.value)})}
+                value={config.umbral_peatones || 0}
+                onChange={(e) => setConfig({...config, umbral_peatones: parseInt(e.target.value) || 0})}
                 disabled={!editandoConfig}
                 style={{...styles.input, opacity: editandoConfig ? 1 : 0.5}}
               />
@@ -643,10 +678,35 @@ export default function TrafficDashboard() {
                 onMouseOver={(e) => e.target.style.backgroundColor = '#15803d'}
                 onMouseOut={(e) => e.target.style.backgroundColor = '#16a34a'}
               >
-                💾 Guardar y Enviar a ESP32
+                💾 Guardar y Enviar a ESP32 vía MQTT
               </button>
             </div>
           )}
+        </div>
+
+        {/* Información de Conexión */}
+        <div style={{...styles.card, marginTop: '32px', backgroundColor: '#0f172a'}}>
+          <h3 style={{fontSize: '18px', marginBottom: '12px'}}>📡 Estado de Conexión & Debug</h3>
+          <div style={{fontSize: '14px', color: '#94a3b8', lineHeight: '1.8'}}>
+            <p>• WebSocket: {esp32Conectado ? '✅ Conectado' : '❌ Desconectado'}</p>
+            <p>• Servidor Backend: ws://localhost:3000</p>
+            <p>• Broker MQTT: {esp32Conectado ? '✅ Activo' : '❌ Inactivo'}</p>
+            
+            <div style={{marginTop: '16px', padding: '12px', backgroundColor: '#1e293b', borderRadius: '8px'}}>
+              <strong>Estado actual del ESP32:</strong>
+              <pre style={{fontSize: '12px', marginTop: '8px', overflow: 'auto'}}>
+                {JSON.stringify(estado, null, 2)}
+              </pre>
+            </div>
+            
+            <p style={{marginTop: '12px', padding: '12px', backgroundColor: '#1e293b', borderRadius: '8px'}}>
+              💡 <strong>Nota:</strong> Los datos del semáforo se actualizan en tiempo real desde el ESP32 vía MQTT → Backend → WebSocket → Dashboard
+            </p>
+            
+            <div style={{marginTop: '12px', padding: '12px', backgroundColor: '#1e293b', borderRadius: '8px', color: '#fbbf24'}}>
+              🔍 <strong>Debug:</strong> Abre la consola del navegador (F12) para ver los logs detallados de conexión y mensajes MQTT
+            </div>
+          </div>
         </div>
       </div>
     </div>
